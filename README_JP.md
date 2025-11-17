@@ -159,6 +159,34 @@ MaAIモデルへの入力は、`Maai`クラスインスタンスの`process`メ�
     - [TCP通信](example/output/vap_2wav_TCP.py) 🌐
 <br>
 
+    ## 🧾 ONNXエクスポート（Rust推論向け）
+
+    Rust（ort crate）で推論したい場合、VAP-BC（日本語）の学習済み重みをONNXへ変換するスクリプトを同梱しました。
+
+    - 対象リポジトリ（重み）：https://huggingface.co/maai-kyoto/vap_bc_jp
+    - 例の重みファイル：`vap-bc_state_dict_jp_10hz_20000msec.pt`
+    - 出力ONNXは入力として2チャネルの生波形（B x 1 x T）を取り、シーケンス長（フレーム数）分の相槌確率（B x F x 1）を返します。最後のフレームを取り出すと最新時刻の確率になります。
+
+    エクスポート例（CPU）:
+
+    ```bash
+    python tools/export_vap_bc_onnx.py --out ./vap_bc_jp_10hz_20s.onnx \
+        --device cpu --frame-rate 10 --context-sec 20
+    ```
+
+    ローカルにダウンロード済みの `.pt` を指定する場合:
+
+    ```bash
+    python tools/export_vap_bc_onnx.py --out ./vap_bc_jp_10hz_20s.onnx \
+        --local-weights /path/to/vap-bc_state_dict_jp_10hz_20000msec.pt
+    ```
+
+    補足:
+    - CPCエンコーダ（`~/.cache/cpc/60k_epoch4-d0f474de.pt`）は未保存時に自動ダウンロードされます。
+    - ONNX opsetはデフォルトで 17 を使用し、入力時間長・出力フレーム長はダイナミック軸としてエクスポートされます。
+    - Rustでは `ort` クレートで `x1`, `x2`（それぞれ [B,1,T]）を入力、`p_bc_seq`（[B,F,1]）を出力として扱ってください。
+
+
 ## 📚 論文・参考文献
 
 本リポジトリを利用した成果を発表する際は、以下の論文を引用してください🙏
