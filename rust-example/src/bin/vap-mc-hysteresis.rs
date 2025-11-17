@@ -58,6 +58,10 @@ struct Args {
     /// Number of times to run inference for benchmarking (default: 1)
     #[arg(long, default_value = "1")]
     benchmark_runs: usize,
+
+    /// Number of intra-op threads for ONNX Runtime (default: 4)
+    #[arg(long, default_value = "4")]
+    threads: usize,
 }
 
 fn load_wav_as_f32(path: &PathBuf) -> Result<Vec<f32>> {
@@ -322,9 +326,11 @@ fn main() -> Result<()> {
 
     println!("Loading ONNX model from: {}", args.model.display());
     let mut session = Session::builder()?
-        .with_intra_threads(4)?
+        .with_intra_threads(args.threads)?
         .commit_from_file(&args.model)
         .context("Failed to load ONNX model")?;
+
+    println!("ONNX Runtime using {} threads", args.threads);
 
     println!("Loading WAV file 1 (user): {}", args.wav1.display());
     let wav1 = load_wav_as_f32(&args.wav1)?;
