@@ -5,6 +5,7 @@ use ndarray::Array3;
 use ort::session::Session;
 use ort::value::Value;
 use std::path::PathBuf;
+use std::time::Instant;
 
 /// VAP-MC inference with hysteresis and debouncing for stable turn-taking detection
 #[derive(Parser, Debug)]
@@ -49,6 +50,14 @@ struct Args {
     /// Optional: dump per-frame outputs (p_now, p_future, vad) as CSV to this path
     #[arg(long)]
     dump_csv: Option<PathBuf>,
+
+    /// Model context length in seconds (e.g., 2.5, 20.0)
+    #[arg(long, default_value = "20.0")]
+    context_sec: f32,
+
+    /// Number of times to run inference for benchmarking (default: 1)
+    #[arg(long, default_value = "1")]
+    benchmark_runs: usize,
 }
 
 fn load_wav_as_f32(path: &PathBuf) -> Result<Vec<f32>> {
@@ -114,26 +123,38 @@ struct VapMcOutput {
     vad: Array3<f32>,
 }
 
-fn run_inference(session: &mut Session, wav1: Vec<f32>, wav2: Vec<f32>) -> Result<VapMcOutput> {
-    let expected_len = 320000;
+fn run_inference(
+    session: &mut Session,
+    wav1: Vec<f32>,
+    wav2: Vec<f32>,
+    context_sec: f32,
+) -> Result<VapMcOutput> {
+    let expected_len = (16000.0 * context_sec) as usize; // e.g., 40000 for 2.5s, 320000 for 20s
     let max_len = wav1.len().max(wav2.len());
 
-    let target_len = if max_len > expected_len {
+    // Always use expected_len (pad short audio, truncate long audio)
+    let target_len = expected_len;
+
+    if max_len > expected_len {
         eprintln!(
             "Warning: Input audio is longer than model expects ({} > {}). Truncating to first {:.2}s",
-            max_len, expected_len, expected_len as f32 / 16000.0
+            max_len, expected_len, context_sec
         );
-        expected_len
-    } else {
-        max_len
-    };
+    } else if max_len < expected_len {
+        eprintln!(
+            "Info: Input audio is shorter than model expects ({} < {}). Padding with silence to {:.2}s",
+            max_len, expected_len, context_sec
+        );
+    }
 
     let mut wav1_padded = wav1;
     let mut wav2_padded = wav2;
 
+    // Truncate if longer than expected
     wav1_padded.truncate(target_len);
     wav2_padded.truncate(target_len);
 
+    // Pad with silence (0.0) if shorter than expected
     if wav1_padded.len() < target_len {
         wav1_padded.resize(target_len, 0.0);
     }
@@ -321,11 +342,96 @@ fn main() -> Result<()> {
         wav2.len() as f32 / 16000.0
     );
 
-    println!("\nRunning VAP-MC inference...");
-    let output = run_inference(&mut session, wav1, wav2)?;
+    // Run inference multiple times for benchmarking
+    println!(
+        "\nRunning VAP-MC inference ({} runs)...",
+        args.benchmark_runs
+    );
+    let mut inference_times = Vec::with_capacity(args.benchmark_runs);
+    let mut output = None;
 
+    for run in 0..args.benchmark_runs {
+        let inference_start = Instant::now();
+        let result = run_inference(&mut session, wav1.clone(), wav2.clone(), args.context_sec)?;
+        let inference_time = inference_start.elapsed();
+        inference_times.push(inference_time);
+
+        // Show detailed timing for small number of runs or first/last runs
+        if args.benchmark_runs <= 20 {
+            println!(
+                "  Run {}: {:.2}ms",
+                run + 1,
+                inference_time.as_secs_f64() * 1000.0
+            );
+        } else if run == 0 {
+            println!(
+                "  Run 1 (cold): {:.2}ms",
+                inference_time.as_secs_f64() * 1000.0
+            );
+        } else if run == args.benchmark_runs - 1 {
+            println!(
+                "  Run {} (warm): {:.2}ms",
+                run + 1,
+                inference_time.as_secs_f64() * 1000.0
+            );
+        }
+
+        // Keep the last output for analysis
+        output = Some(result);
+    }
+
+    let output = output.unwrap();
     let num_frames = output.vad.shape()[1];
-    println!("Number of frames: {}", num_frames);
+
+    // Calculate statistics
+    if args.benchmark_runs > 1 {
+        let total_ms: f64 = inference_times
+            .iter()
+            .map(|t| t.as_secs_f64() * 1000.0)
+            .sum();
+        let mean_ms = total_ms / inference_times.len() as f64;
+        let first_ms = inference_times[0].as_secs_f64() * 1000.0;
+        let min_ms = inference_times
+            .iter()
+            .map(|t| t.as_secs_f64() * 1000.0)
+            .fold(f64::INFINITY, f64::min);
+        let max_ms = inference_times
+            .iter()
+            .map(|t| t.as_secs_f64() * 1000.0)
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        // Calculate warm runs average (excluding first run)
+        let warm_avg_ms = if inference_times.len() > 1 {
+            let warm_total: f64 = inference_times[1..]
+                .iter()
+                .map(|t| t.as_secs_f64() * 1000.0)
+                .sum();
+            warm_total / (inference_times.len() - 1) as f64
+        } else {
+            mean_ms
+        };
+
+        println!("\nInference Statistics:");
+        println!("  Runs: {}", args.benchmark_runs);
+        println!("  First (cold): {:.2}ms", first_ms);
+        println!(
+            "  Warm average: {:.2}ms ({:.2}ms per frame)",
+            warm_avg_ms,
+            warm_avg_ms / num_frames as f64
+        );
+        println!("  Min: {:.2}ms", min_ms);
+        println!("  Max: {:.2}ms", max_ms);
+        println!("  Mean: {:.2}ms", mean_ms);
+    } else {
+        let inference_time = inference_times[0];
+        println!("Number of frames: {}", num_frames);
+        println!(
+            "Inference time: {:.2}ms ({:.2}ms per frame)",
+            inference_time.as_secs_f64() * 1000.0,
+            inference_time.as_secs_f64() * 1000.0 / num_frames as f64
+        );
+    }
+
     let frame_rate = 20.0; // 20Hz (50ms per frame)
 
     // Extract probabilities
